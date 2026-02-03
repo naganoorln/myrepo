@@ -1,0 +1,315 @@
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <libssh/libssh.h>
+#include <libssh/server.h>
+#include <time.h>
+
+#include "cli.h"
+#include "session.h"
+#include "commands.h"
+
+#define CMD_BUF_SIZE 256
+
+static int next_session_id = 1;
+
+/* ================= TELNET SESSION ADD ================= */
+
+static int add_telnet_session(int fd, struct sockaddr_in *addr) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!sessions[i].used) {
+            sessions[i].used = 1;
+            sessions[i].fd = fd;
+            sessions[i].addr = *addr;
+            sessions[i].session_id = next_session_id++;
+            sessions[i].last_activity = time(NULL);
+            sessions[i].priv = PRIV_USER;
+            sessions[i].type = SESSION_TELNET;
+            sessions[i].cmd_len = 0;
+
+            session_write(
+                &sessions[i],
+                "\r\nWelcome to CLI\r\nType 'help' or '?' to know available commands\r\n",
+                66
+            );
+            send_prompt(&sessions[i]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* ================= SSH SESSION ADD ================= */
+
+static int add_ssh_session(ssh_session sess, ssh_channel chan) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+         if (!sessions[i].used) {
+             sessions[i].used = 1;
+             sessions[i].ssh_sess = sess;
+             sessions[i].ssh_chan = chan;
+             sessions[i].type = SESSION_SSH;
+             sessions[i].priv = PRIV_USER;
+             sessions[i].session_id = next_session_id++;
+             sessions[i].last_activity = time(NULL);
+             sessions[i].cmd_len = 0;
+
+             session_write(
+                 &sessions[i],
+                 "\r\nWelcome to CLI\r\nType 'help' or '?' to know available commands\r\n",
+                 66
+             );
+             send_prompt(&sessions[i]);
+             return 0;
+         }
+    }
+    return -1;
+}
+
+/* ================= MAIN SERVER LOOP ================= */
+
+void server_loop(void) {
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
+    listen(listen_fd, 5);
+
+    /* ================= SSH SETUP ================= */
+
+    ssh_bind sshbind = ssh_bind_new();
+    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDADDR, "0.0.0.0");
+
+    int port_ssh = PORT + 1;
+    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDPORT, &port_ssh);
+    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, "ssh-rsa");
+    ssh_bind_options_set(
+        sshbind,
+        SSH_BIND_OPTIONS_RSAKEY,
+        "/etc/ssh/ssh_host_rsa_key"
+    );
+
+    ssh_bind_listen(sshbind);
+
+    int ssh_fd = ssh_bind_get_fd(sshbind);
+
+    printf(
+        "CLI daemon listening on port %d (Telnet) and %d (SSH)\n",
+        PORT,
+        port_ssh
+    );
+
+    /* ================= EVENT LOOP ================= */
+
+    while (1) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+
+        FD_SET(listen_fd, &readfds);
+        FD_SET(ssh_fd, &readfds);
+
+        int maxfd = listen_fd;
+        if (ssh_fd > maxfd) maxfd = ssh_fd;
+
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            if (sessions[i].used &&
+                sessions[i].type == SESSION_TELNET) {
+
+                FD_SET(sessions[i].fd, &readfds);
+                if (sessions[i].fd > maxfd)
+                    maxfd = sessions[i].fd;
+            }
+        }
+
+        struct timeval tv = {1, 0};
+        select(maxfd + 1, &readfds, NULL, NULL, &tv);
+
+        /* ================= TELNET ACCEPT ================= */
+
+        if (FD_ISSET(listen_fd, &readfds)) {
+            struct sockaddr_in cliaddr;
+            socklen_t len = sizeof(cliaddr);
+
+            int fd = accept(
+                listen_fd,
+                (struct sockaddr *)&cliaddr,
+                &len
+            );
+
+            if (add_telnet_session(fd, &cliaddr) < 0) {
+                write(fd, "Too many sessions\r\n", 19);
+                close(fd);
+            }
+        }
+
+        /* ================= TELNET INPUT ================= */
+
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            if (sessions[i].used &&
+                sessions[i].type == SESSION_TELNET &&
+                FD_ISSET(sessions[i].fd, &readfds)) {
+
+                char c;
+
+                while (read(sessions[i].fd, &c, 1) > 0) {
+                    sessions[i].last_activity = time(NULL);
+
+                    if (c == '\r')
+                        continue;
+
+                    if (c == '\n') {
+                        sessions[i].cmd_buf[sessions[i].cmd_len] = 0;
+                        process_command(i, sessions[i].cmd_buf);
+                        sessions[i].cmd_len = 0;
+                        break;
+                    }
+
+                    if (sessions[i].cmd_len < CMD_BUF_SIZE - 1) {
+                        sessions[i].cmd_buf[sessions[i].cmd_len++] = c;
+                    }
+                }
+            }
+        }
+
+        /* ================= SSH ACCEPT (NON-BLOCKING) ================= */
+
+        if (FD_ISSET(ssh_fd, &readfds)) {
+            ssh_session sess = ssh_new();
+            int rc = ssh_bind_accept(sshbind, sess);
+
+            if (rc == SSH_OK) {
+                ssh_handle_key_exchange(sess);
+
+                /* AUTH */
+                int auth_ok = 0;
+                ssh_message msg;
+
+                while ((msg = ssh_message_get(sess)) != NULL) {
+                    if (ssh_message_type(msg) == SSH_REQUEST_AUTH) {
+                        ssh_message_auth_reply_success(msg, 0);
+                        auth_ok = 1;
+                        ssh_message_free(msg);
+                        break;
+                    }
+                    ssh_message_reply_default(msg);
+                    ssh_message_free(msg);
+                }
+
+                if (!auth_ok) {
+                    ssh_disconnect(sess);
+                    ssh_free(sess);
+                    goto ssh_done;
+                }
+
+                /* CHANNEL OPEN */
+                ssh_channel chan = NULL;
+                while ((msg = ssh_message_get(sess)) != NULL) {
+                    if (ssh_message_type(msg) ==
+                            SSH_REQUEST_CHANNEL_OPEN &&
+                        ssh_message_subtype(msg) ==
+                            SSH_CHANNEL_SESSION) {
+
+                        chan =
+                            ssh_message_channel_request_open_reply_accept(msg);
+                        ssh_message_free(msg);
+                        break;
+                    }
+                    ssh_message_reply_default(msg);
+                    ssh_message_free(msg);
+                }
+
+                if (!chan) {
+                    ssh_disconnect(sess);
+                    ssh_free(sess);
+                    goto ssh_done;
+                }
+
+                /* PTY + SHELL */
+                while ((msg = ssh_message_get(sess)) != NULL) {
+                    if (ssh_message_type(msg) == SSH_REQUEST_CHANNEL) {
+                        ssh_message_channel_request_reply_success(msg);
+                        ssh_message_free(msg);
+                        break;
+                    }
+                    ssh_message_reply_default(msg);
+                    ssh_message_free(msg);
+                }
+                
+		/* ADD SSH SESSION */
+                if (add_ssh_session(sess, chan) < 0) {
+		    ssh_channel_write(chan, "Too many sessions\r\n", 19);
+		    ssh_channel_close(chan);
+		    ssh_channel_free(chan);
+		    ssh_disconnect(sess);
+                    ssh_free(sess);
+		    ssh_bind_free(sshbind);
+                    goto ssh_done;
+                }
+
+            } else {
+                ssh_free(sess);
+            }
+        }
+
+ssh_done:
+
+        /* ================= SSH INPUT (CHARACTER MODE) ================= */
+        for (int i = 0; i < MAX_SESSIONS; i++) {
+            if (sessions[i].used &&
+                sessions[i].type == SESSION_SSH) {
+		ssh_channel_set_blocking(sessions[i].ssh_chan, 0);
+
+		char c;
+                int n;
+
+                while ((n = ssh_channel_read_nonblocking(
+            		    sessions[i].ssh_chan,
+            		    &c,
+            		    1,
+                            0)) > 0) {
+		    ssh_channel_write(sessions[i].ssh_chan, &c, 1); 
+		    sessions[i].last_activity = time(NULL);
+	            
+		    /* Handle ENTER */
+	            if (c == '\r' || c == '\n') {
+        		ssh_channel_write(sessions[i].ssh_chan, "\r\n", 2);
+        		sessions[i].cmd_buf[sessions[i].cmd_len] = '\0';
+        		if (sessions[i].cmd_len > 0) {
+            		    process_command(i, sessions[i].cmd_buf);
+        		}
+	                sessions[i].cmd_len = 0;
+        		break;
+    		    }
+
+                    /* Backspace */
+    		    if (c == 0x7f || c == 0x08) {
+        		if (sessions[i].cmd_len > 0) {
+            		    sessions[i].cmd_len--;
+            		    ssh_channel_write(sessions[i].ssh_chan, "\b \b", 3);
+        		}
+        		continue;
+    		    }
+
+                    /* Echo normal character */
+   		    if (sessions[i].cmd_len < CMD_BUF_SIZE - 1) {
+        		sessions[i].cmd_buf[sessions[i].cmd_len++] = c;
+        		//ssh_channel_write(sessions[i].ssh_chan, &c, 1);
+    		    }	
+		}	    
+
+            }
+        }
+
+        check_session_timeouts();
+    }
+}
+

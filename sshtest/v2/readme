@@ -1,0 +1,52 @@
+SSH Server Thread Pool & Queue Summary
+
+Setup
+Thread pool size: 4 (4 worker threads)
+Queue size: 16 (waiting sessions)
+Clients: connecting sequentially
+
+Step 1: Initial Connections
+4 clients connect → immediately handled by the 4 worker threads.
+Each worker busy in interactive_shell().
+No threads available for new connections.
+
+Step 2: Queuing Additional Connections
+Next 16 clients connect → no free threads.
+Main thread enqueues these sessions in the queue.
+queue.count = 16 → queue full.
+Workers remain busy handling the first 4 interactive sessions.
+Signal (pthread_cond_signal()) called on enqueue → lost because all workers are busy.
+
+Step 3: Queue Full
+Any additional client beyond 20 total connections (4 active + 16 queued):
+Queue is full → connection dropped immediately.
+These clients do not reach key exchange or authentication.
+
+Step 4: Worker Becomes Free
+When any active client exits (types exit):
+Worker cleans up the session.
+Worker loops back to while(1) and checks the queue.
+queue.count > 0 → worker dequeues the first session in the queue.
+Key exchange and authentication are performed.
+Interactive session starts with the client.
+
+Step 5: Continuous Operation
+Worker threads never exit.
+Each worker repeatedly:
+Checks queue → dequeues if session exists
+Handles session interactively
+Cleans up on client exit → loops again
+Sleeps on pthread_cond_wait() if queue empty
+Signal is only used to wake sleeping workers, not busy ones.
+Queue ensures smooth handling of bursts without creating new threads for every connection.
+
+Key Observations
+
+Thread pool (4) → max active interactive sessions
+Queue (16) → holds waiting clients until workers become free
+Excess clients beyond 20 → dropped immediately
+Workers reuse → one thread handles multiple sessions sequentially
+Lost signals → harmless, queued sessions handled as soon as a worker is free
+
+✅ Conclusion:
+With 4 workers and a queue of 16, up to 20 clients can be connected simultaneously (4 active, 16 queued). Worker threads handle sessions interactively and loop forever. New sessions in the queue are picked immediately when a worker becomes free. Excess connections beyond pool + queue are dropped. Signals only wake sleeping threads; busy threads ignore them, but queued sessions are still handled.
