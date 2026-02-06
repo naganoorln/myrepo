@@ -65,7 +65,7 @@ void publish(Event e, Transaction *tx) {
     }
 }
 
-/* Core Oerations */
+/* Core Operations */
 
 int validate(Transaction *tx) {
     return tx->amount > 0 && tx->from->balance >= tx->amount;
