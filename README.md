@@ -116,3 +116,31 @@ origin/main → main branch on GitHub (remote)
 Done 
 
 You’ve successfully created a repository and made your first Git commit!
+
+
+
+Generate GitHub Personal Access Token (classic)
+https://github.com/settings/tokens
+
+Once you open that, choose “Tokens (classic)” and then “Generate new token”.
+
+Step-by-step within the link
+
+Open the link above in your browser
+
+If prompted, log into your GitHub account
+
+In Personal access tokens → Tokens (classic) click:
+Generate new token (classic)
+
+Enter a Note/Name (e.g., VM Git token)
+
+Choose expiration (e.g., 90 days or longer)
+
+Under Scopes, check:
+
+repo (for access to repositories)
+
+Scroll down and click Generate token
+
+Copy the token (ghp_...) immediately — you won’t see it again
